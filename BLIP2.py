@@ -31,15 +31,26 @@ try:
 except RuntimeError:
     pass
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
+
 processor = AutoProcessor.from_pretrained("Salesforce/blip2-opt-2.7b")
-model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
-device = "cuda:0"
+model = Blip2ForConditionalGeneration.from_pretrained(
+    "Salesforce/blip2-opt-2.7b",
+    torch_dtype=dtype
+)
 model.to(device)
 
 def process_image(image_path):
     image = Image.open(image_path).convert('RGB')  
-    image.resize((596, 437))
-    inputs = processor(image, return_tensors="pt").to(device, torch.float16)
+    image = image.resize((596, 437))
+
+    inputs = processor(image, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    if device == "cuda":
+        inputs = {k: v.to(torch.float16) if v.dtype == torch.float32 else v for k, v in inputs.items()}
+
     generated_ids = model.generate(**inputs)
     generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
     return generated_text
