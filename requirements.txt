@@ -6,7 +6,7 @@ async-timeout==4.0.3
 attrs==23.2.0
 certifi==2024.6.2
 charset-normalizer==3.3.2
--e git+https://github.com/openai/CLIP.git@a1d071733d7111c9c014f024669f959182114e33#egg=clip
+-e ./hand1000/src/clip
 contourpy==1.2.1
 cycler==0.12.1
 einops==0.8.0
@@ -45,7 +45,7 @@ nvidia-nvjitlink-cu12==12.5.40
 nvidia-nvtx-cu12==12.1.105
 omegaconf==2.3.0
 packaging==24.0
-pillow==10.3.0
+pillow==10.4.0
 protobuf==3.20.1
 pyDeprecate==0.3.2
 pyparsing==3.1.2
