@@ -1,6 +1,7 @@
 from omegaconf import OmegaConf
 import torch
 from torch import nn
+from torch.cuda.amp import autocast
 from PIL import Image
 from torchvision import transforms
 import os
@@ -137,9 +138,9 @@ config="./stable-diffusion/configs/stable-diffusion/v1-inference.yaml"
 ckpt = "./stable-diffusion/models/ldm/stable-diffusion-v1/sd-v1-4-full-ema.ckpt"
 
 scale=3
-h=512
-w=512
-ddim_steps=45
+h=384
+w=384
+ddim_steps=30
 ddim_eta=0.0
 
 model = load_model_from_config(config, ckpt, device)
@@ -158,8 +159,8 @@ for idx in tqdm(range(nums), desc="Processing images"):
 
     torch.manual_seed(0)
 
-    init_latent = model.get_first_stage_encoding(model.encode_first_stage(image))
-    orig_embs = model.get_learned_conditioning([prompt])
+    init_latent = model.get_first_stage_encoding(model.encode_first_stage(image)).detach()
+    orig_embs = model.get_learned_conditioning([prompt]).detach()
 
     prompt_embedding = orig_embs.cpu().numpy()
     #nearest_idx = find_nearest_encode(prompt_embedding, encodes)
@@ -189,16 +190,17 @@ for idx in tqdm(range(nums), desc="Processing images"):
     # Text Embedding Optimization
     for i in pbar:
         opt.zero_grad()
-        noise = torch.randn_like(init_latent)
-        t_enc = torch.randint(1000, (1,), device=device)
-        z = model.q_sample(init_latent, t_enc, noise=noise)
-
-        pred_noise = model.apply_model(z, t_enc, fused_feature)
-        loss = criteria(pred_noise, noise)
+        with autocast():
+            noise = torch.randn_like(init_latent)
+            t_enc = torch.randint(1000, (1,), device=device)
+            z = model.q_sample(init_latent, t_enc, noise=noise)
+            pred_noise = model.apply_model(z, t_enc, fused_feature)
+            loss = criteria(pred_noise, noise)
         loss.backward()
         history.append(loss.item())
         opt.step()
-
+    
+    torch.cuda.empty_cache()
     fused_feature.requires_grad = False
     model.train()
 
@@ -214,16 +216,17 @@ for idx in tqdm(range(nums), desc="Processing images"):
     # Stable Diffusion Fine-tuning
     for i in pbar:
         opt.zero_grad()
-        noise = torch.randn_like(orig_latent)
-        t_enc = torch.randint(model.num_timesteps, (1,), device=device)
-        z = model.q_sample(orig_latent, t_enc, noise=noise)
-
-        pred_noise = model.apply_model(z, t_enc, fused_feature)
-        loss = criteria(pred_noise, noise)
+        with autocast():
+            noise = torch.randn_like(orig_latent)
+            t_enc = torch.randint(model.num_timesteps, (1,), device=device)
+            z = model.q_sample(orig_latent, t_enc, noise=noise)
+            pred_noise = model.apply_model(z, t_enc, fused_feature)
+            loss = criteria(pred_noise, noise)
         loss.backward()
         history.append(loss.item())
         opt.step()
-
+    
+    torch.cuda.empty_cache()
     if (idx + 1) % 1000 == 0:
         ckpt_save_path = f"./model_finetuned.ckpt"
         torch.save({
