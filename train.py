@@ -27,13 +27,20 @@ def load_model_from_config(config, ckpt, device="cpu", verbose=False):
     if isinstance(config, (str, Path)):
         config = OmegaConf.load(config)
 
-    pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False)
+    # Load checkpoint directly to GPU to avoid duplicate copies in memory
+    pl_sd = torch.load(ckpt, map_location=device, weights_only=False)
     sd = pl_sd["state_dict"]
+    del pl_sd  # Free the checkpoint from memory
+    
     model = instantiate_from_config(config.model)
-    m, u = model.load_state_dict(sd, strict=False)
     model.to(device)
+    m, u = model.load_state_dict(sd, strict=False)
+    del sd  # Free state dict after loading
+    
     model.eval()
     model.cond_stage_model.device = device
+    torch.cuda.empty_cache()
+    
     return model
 
 @torch.no_grad()
@@ -138,9 +145,9 @@ config="./stable-diffusion/configs/stable-diffusion/v1-inference.yaml"
 ckpt = "./stable-diffusion/models/ldm/stable-diffusion-v1/sd-v1-4-full-ema.ckpt"
 
 scale=3
-h=384
-w=384
-ddim_steps=30
+h=192
+w=192
+ddim_steps=15
 ddim_eta=0.0
 
 model = load_model_from_config(config, ckpt, device)
@@ -149,10 +156,11 @@ sampler = DDIMSampler(model)
 fusion_model = FusionModel(encode_size=59136, feature_size=63).to(device)  # gesture feature size is 63
 
 # Load all npy encodes
-encode_file_paths = [os.path.join(encode_folder, f) for f in os.listdir(encode_folder)]
-encodes = load_encodes(encode_file_paths)
+#encode_file_paths = [os.path.join(encode_folder, f) for f in os.listdir(encode_folder)]
+#encodes = load_encodes(encode_file_paths)
 
 for idx in tqdm(range(nums), desc="Processing images"):
+    torch.cuda.empty_cache()  # Clear GPU memory at start of each iteration
     image_path = os.path.join(image_folder, image_filenames[idx])
     image = load_img(image_path).unsqueeze(0).to(device)
     prompt = prompts[idx]
@@ -179,7 +187,7 @@ for idx in tqdm(range(nums), desc="Processing images"):
     fused_feature_1 = args.Lambda * orig_embs + (1.0 - args.Lambda) * fused_feature_orig
     fused_feature = fused_feature_1.clone().detach().requires_grad_(True)
     lr = 0.001
-    it = 10
+    it = 5
     opt = torch.optim.Adam([fused_feature], lr=lr)
     criteria = torch.nn.MSELoss()
     history = []
@@ -205,7 +213,7 @@ for idx in tqdm(range(nums), desc="Processing images"):
     model.train()
 
     lr = 1e-6
-    it = 20
+    it = 10
     opt = torch.optim.Adam([{'params': model.model.parameters()}], lr=lr)
     criteria = torch.nn.MSELoss()
     history = []
