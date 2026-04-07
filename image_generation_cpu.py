@@ -16,6 +16,14 @@ sys.path.append('./stable-diffusion')
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.util import instantiate_from_config
 
+
+def _cpu_register_buffer(self, name, attr):
+    if isinstance(attr, torch.Tensor):
+        attr = attr.to(torch.device("cpu"))
+    setattr(self, name, attr)
+
+DDIMSampler.register_buffer = _cpu_register_buffer
+
 # ----------------------
 # Arguments
 # ----------------------
