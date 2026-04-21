@@ -1,2 +1,4 @@
 /hand1000
 /hagrid-sample-30k-384p
+*.ckpt
+.zip
