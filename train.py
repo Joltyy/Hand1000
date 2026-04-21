@@ -4,11 +4,11 @@ from torch import nn
 from PIL import Image
 from torchvision import transforms
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from tqdm import tqdm
 from einops import rearrange
 import numpy as np
 from pathlib import Path
-from sklearn.metrics.pairwise import cosine_similarity
 import argparse
 
 import sys
@@ -16,10 +16,13 @@ sys.path.append('./stable-diffusion')
 
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.util import instantiate_from_config
+from torch.amp import autocast as amp_autocast
+
 
 parser = argparse.ArgumentParser(description='Train the model')
 parser.add_argument('--gesture', type=str, required=True, help='Gesture name')
 parser.add_argument('--Lambda', type=float, default=0.7, help='Hyperparameter Lambda')
+parser.add_argument('--use_amp', action='store_true', help='Enable AMP. Keep off if checkpoint-related dtype issues appear.')
 args = parser.parse_args()
 
 def load_model_from_config(config, ckpt, device="cpu", verbose=False):
@@ -54,7 +57,7 @@ def sample_model(model, sampler, c, h, w, ddim_steps, scale, ddim_eta, start_cod
                                     )
     return samples_ddim
 
-def load_img(path, target_size=512):
+def load_img(path, target_size=256):
     image = Image.open(path).convert("RGB")
     tform = transforms.Compose([
             transforms.Resize(target_size),
@@ -72,16 +75,20 @@ def decode_to_im(samples, n_samples=1, nrow=1):
     return img
 
 class FusionModel(nn.Module):
-    def __init__(self, encode_size, feature_size):
+    def __init__(self, feature_size, embed_dim=768, hidden_dim=256):
         super(FusionModel, self).__init__()
-        self.fc = nn.Linear(encode_size + feature_size, encode_size)
+        # Map gesture feature to a compact token-space bias.
+        self.net = nn.Sequential(
+            nn.Linear(feature_size, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, embed_dim)
+        )
 
     def forward(self, encode, feature):
-        # Unsqueeze feature to make it 2-dimensional
-        feature = feature.unsqueeze(0)
-        fused_feature = torch.cat((encode, feature), dim=1)
-        result = self.fc(fused_feature)
-        return result
+        if feature.dim() == 1:
+            feature = feature.unsqueeze(0)
+        bias = self.net(feature).unsqueeze(1)  # [B, 1, 768]
+        return encode + bias
 
 '''
 class FusionModel(nn.Module):
@@ -137,19 +144,46 @@ config="./stable-diffusion/configs/stable-diffusion/v1-inference.yaml"
 ckpt = "./stable-diffusion/models/ldm/stable-diffusion-v1/sd-v1-4-full-ema.ckpt"
 
 scale=3
-h=512
-w=512
+h=256
+w=256
 ddim_steps=45
 ddim_eta=0.0
 
 model = load_model_from_config(config, ckpt, device)
+use_amp = args.use_amp
+
+#unfreeze only partial params
+for p in model.model.parameters():
+    p.requires_grad = False
+
+train_patterns = (
+    "attn",
+    "transformer_blocks",
+    "to_q", "to_k", "to_v", "to_out"
+)
+
+for name, p in model.model.named_parameters():
+    if any(k in name for k in train_patterns):
+        p.requires_grad = True
+
+num_trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+num_total = sum(p.numel() for p in model.model.parameters())
+print(f"Trainable params: {num_trainable:,} / {num_total:,}")
+
+# Disable all checkpoint flags from training script to avoid AMP+checkpoint dtype mismatch.
+model.model.diffusion_model.gradient_checkpointing = False
+for module in model.modules():
+    if hasattr(module, "use_checkpoint"):
+        module.use_checkpoint = False
+    if hasattr(module, "checkpoint"):
+        module.checkpoint = False
+    if hasattr(module, "gradient_checkpointing"):
+        module.gradient_checkpointing = False
+
+
 sampler = DDIMSampler(model)
 
-fusion_model = FusionModel(encode_size=59136, feature_size=63).to(device)  # gesture feature size is 63
-
-# Load all npy encodes
-encode_file_paths = [os.path.join(encode_folder, f) for f in os.listdir(encode_folder)]
-encodes = load_encodes(encode_file_paths)
+fusion_model = FusionModel(feature_size=63, embed_dim=768, hidden_dim=256).to(device)
 
 for idx in tqdm(range(nums), desc="Processing images"):
     image_path = os.path.join(image_folder, image_filenames[idx])
@@ -158,11 +192,11 @@ for idx in tqdm(range(nums), desc="Processing images"):
 
     torch.manual_seed(0)
 
-    init_latent = model.get_first_stage_encoding(model.encode_first_stage(image))
-    orig_embs = model.get_learned_conditioning([prompt])
+    with torch.no_grad():
+        init_latent = model.get_first_stage_encoding(model.encode_first_stage(image)).detach()
+        orig_embs = model.get_learned_conditioning([prompt]).detach()
 
-    prompt_embedding = orig_embs.cpu().numpy()
-    #nearest_idx = find_nearest_encode(prompt_embedding, encodes)
+    #nearest_idx = find_nearest_encode(orig_embs.cpu().numpy(), encodes)
     #name = os.listdir(feature_folder)[nearest_idx]
     
     #feature_npy_path = os.path.join(feature_folder, name)
@@ -170,9 +204,7 @@ for idx in tqdm(range(nums), desc="Processing images"):
 
     feature.requires_grad = False
 
-    # Concatenation and FC mapping
-    fused_feature_orig = fusion_model(orig_embs.view(1, -1), feature)
-    fused_feature_orig = fused_feature_orig.view(orig_embs.shape)
+    fused_feature_orig = fusion_model(orig_embs, feature)
 
     # linear interpolation
     fused_feature_1 = args.Lambda * orig_embs + (1.0 - args.Lambda) * fused_feature_orig
@@ -180,8 +212,8 @@ for idx in tqdm(range(nums), desc="Processing images"):
     lr = 0.001
     it = 10
     #trying sgd for lower memory usage
-    #opt = torch.optim.Adam([fused_feature], lr=lr)
-    opt = torch.optim.SGD([fused_feature], lr=lr)
+    opt = torch.optim.Adam([fused_feature], lr=lr)
+    #opt = torch.optim.SGD([fused_feature], lr=lr)
     criteria = torch.nn.MSELoss()
     history = []
 
@@ -195,8 +227,11 @@ for idx in tqdm(range(nums), desc="Processing images"):
         t_enc = torch.randint(1000, (1,), device=device)
         z = model.q_sample(init_latent, t_enc, noise=noise)
 
-        pred_noise = model.apply_model(z, t_enc, fused_feature)
-        loss = criteria(pred_noise, noise)
+        with amp_autocast("cuda", enabled=use_amp):
+            cond = fused_feature.to(dtype=z.dtype)
+            pred_noise = model.apply_model(z, t_enc, cond)
+            loss = criteria(pred_noise.float(), noise.float())
+
         loss.backward()
         history.append(loss.item())
         opt.step()
@@ -208,7 +243,11 @@ for idx in tqdm(range(nums), desc="Processing images"):
     it = 20
     #trying sgd for lower memory usage
     #opt = torch.optim.Adam([{'params': model.model.parameters()}], lr=lr)
-    opt = torch.optim.SGD([{'params': model.model.parameters()}], lr=lr)
+    opt = torch.optim.AdamW(
+        [p for p in model.model.parameters() if p.requires_grad],
+        lr=lr
+    )
+    #opt = torch.optim.SGD([fused_feature], lr=lr)
     criteria = torch.nn.MSELoss()
     history = []
 
@@ -222,11 +261,18 @@ for idx in tqdm(range(nums), desc="Processing images"):
         t_enc = torch.randint(model.num_timesteps, (1,), device=device)
         z = model.q_sample(orig_latent, t_enc, noise=noise)
 
-        pred_noise = model.apply_model(z, t_enc, fused_feature)
-        loss = criteria(pred_noise, noise)
+        with amp_autocast("cuda", enabled=use_amp):
+            cond = fused_feature.to(dtype=z.dtype)
+            pred_noise = model.apply_model(z, t_enc, cond)
+            loss = criteria(pred_noise.float(), noise.float())
+
         loss.backward()
         history.append(loss.item())
         opt.step()
+
+    # Release references early to reduce memory growth across dataset loop.
+    del image, init_latent, orig_embs, feature, fused_feature_orig, fused_feature, orig_latent
+    torch.cuda.empty_cache()
 
     if (idx + 1) % 1000 == 0:
         ckpt_save_path = f"./model_finetuned.ckpt"

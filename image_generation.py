@@ -62,7 +62,7 @@ def sample_model(model, sampler, c, h, w, ddim_steps, scale, ddim_eta, start_cod
                                     )
     return samples_ddim
 
-def load_img(path, target_size=512):
+def load_img(path, target_size=256):
     """Load an image, resize and output -1..1"""
     image = Image.open(path).convert("RGB")
     
@@ -75,7 +75,7 @@ def load_img(path, target_size=512):
     image = tform(image)
     return 2.*image - 1.
 
-def load_img_2(img, target_size=512):
+def load_img_2(img, target_size=256):
     """Load an image, resize and output -1..1"""
     image = img.convert("RGB")
     
@@ -120,8 +120,8 @@ feature_npy_path = args.feature_npy_path
 
 # Generation parameters
 scale=3
-h=512
-w=512
+h=256
+w=256
 ddim_steps=45
 ddim_eta=0.0
 
@@ -144,16 +144,19 @@ def load_encodes(file_paths):
     return np.vstack(embeddings)
 
 class FusionModel(nn.Module):
-    def __init__(self, encode_size, feature_size):
+    def __init__(self, feature_size, embed_dim=768, hidden_dim=256):
         super(FusionModel, self).__init__()
-        self.fc = nn.Linear(encode_size + feature_size, encode_size)
+        self.net = nn.Sequential(
+            nn.Linear(feature_size, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, embed_dim)
+        )
 
     def forward(self, encode, feature):
-        # Unsqueeze feature to make it 2-dimensional
-        feature = feature.unsqueeze(0)
-        fused_feature = torch.cat((encode, feature), dim=1)
-        result = self.fc(fused_feature)
-        return result
+        if feature.dim() == 1:
+            feature = feature.unsqueeze(0)
+        bias = self.net(feature).unsqueeze(1)
+        return encode + bias
 
 '''
 class FusionModel(nn.Module):
@@ -170,7 +173,7 @@ class FusionModel(nn.Module):
         
         return reduced_combined
 '''
-fusion_model = FusionModel(encode_size=59136, feature_size=63).to(device)
+fusion_model = FusionModel(feature_size=63, embed_dim=768, hidden_dim=256).to(device)
 fusion_model_ckpt = torch.load(fusion_model_ckpt_path, map_location=device)
 fusion_model.load_state_dict(fusion_model_ckpt['fusion_model_state_dict'])
 fusion_model.to(device)
@@ -189,29 +192,29 @@ image_size = (400, 400)  # Adjust based on your images
 img_save_path = args.img_save_path
 os.makedirs(img_save_path, exist_ok=True)
 
+# Load the gesture feature once instead of reloading it for every prompt.
+feature = torch.tensor(np.load(feature_npy_path), dtype=torch.float32, device=device)
+
 for num in tqdm(range(nums), desc="Processing images"):
     prompt = prompts[num]  
     torch.manual_seed(0)
-    orig_emb = model.get_learned_conditioning([prompt])
+    with torch.no_grad():
+        orig_emb = model.get_learned_conditioning([prompt]).detach()
 
-    prompt_embedding = orig_emb.cpu().numpy()
-    #nearest_idx = find_nearest_encode(prompt_embedding, encodes)
-    #name = os.listdir(feature_folder)[nearest_idx]
-    
-    feature = torch.tensor(np.load(feature_npy_path), dtype=torch.float32).to(device)
+        # Concatenate the gesture features with the original embeddings
+        fused_feature = fusion_model(orig_emb, feature)
 
-    # Concatenate the gesture features with the original embeddings
-    fused_feature = fusion_model(orig_emb.view(1, -1), feature)
-    fused_feature = fused_feature.view(orig_emb.shape)
+        # ema
+        fused_feature = (1.0 - args.mu) * fused_feature + args.mu * orig_emb
 
-    #ema
-    fused_feature = (1.0 - args.mu) * fused_feature + args.mu * orig_emb
+        # Sample the model with a fixed code to see what it looks like
+        quick_sample = lambda x, s, code: decode_to_im(sample_model(model, sampler, x, h, w, ddim_steps, s, ddim_eta, start_code=code))
+        start_code = torch.randn((5, 4, 64, 64), device=device, dtype=fused_feature.dtype)
+        img = quick_sample(fused_feature.to(dtype=start_code.dtype), scale, start_code)
+        # Resize image to 100x100
+        img = img.resize(image_size)
+        save_path = f"{img_save_path}/{image_filenames[num]}"
+        img.save(save_path)
 
-    # Sample the model with a fixed code to see what it looks like
-    quick_sample = lambda x, s, code: decode_to_im(sample_model(model, sampler, x, h, w, ddim_steps, s, ddim_eta, start_code=code))
-    start_code = torch.randn((5, 4, 64, 64))
-    img = quick_sample(fused_feature, scale, start_code)
-    # Resize image to 100x100
-    img = img.resize(image_size)
-    save_path = f"{img_save_path}/{image_filenames[num]}"
-    img.save(save_path)
+    del orig_emb, fused_feature, start_code, img
+    torch.cuda.empty_cache()
